@@ -8,6 +8,7 @@ from typing import override
 
 from aiohomeconnect.client import Client as HomeConnectClient
 from aiohomeconnect.model import (
+    ArrayOfEvents,
     CommandKey,
     Event,
     EventKey,
@@ -62,6 +63,8 @@ _LOGGER = logging.getLogger(__name__)
 
 MAX_EXECUTIONS_TIME_WINDOW = 60 * 60  # 1 hour
 MAX_EXECUTIONS = 8
+# Minimum time between status fetches while the full refresh is disabled
+THROTTLED_STATUS_FETCH_INTERVAL = 10 * 60  # 10 minutes
 
 type HomeConnectConfigEntry = ConfigEntry[HomeConnectRuntimeData]
 
@@ -306,6 +309,7 @@ class HomeConnectApplianceCoordinator(DataUpdateCoordinator[HomeConnectAppliance
         self.global_listeners = global_listeners
         self.data = HomeConnectApplianceData.empty(appliance)
         self._execution_tracker: list[float] = []
+        self._last_status_fetch: float | None = None
         self.last_fetched_program: tuple[EventKey, ProgramKey] | None = None
 
     def _get_listeners_for_event_key(self, event_key: EventKey) -> list[CALLBACK_TYPE]:
@@ -319,10 +323,12 @@ class HomeConnectApplianceCoordinator(DataUpdateCoordinator[HomeConnectAppliance
         """Attempt to refresh the appliance data.
 
         Check if the appliance data has been refreshed too often recently to avoid
-        hitting the API rate limit. Once refreshed, call all global listeners
+        hitting the API rate limit, in which case only the status is fetched.
+        Once refreshed, call all global listeners
         that are not listening for the DEPAIRED event.
         """
         if self.refreshed_too_often_recently():
+            await self._fetch_status_while_refresh_disabled()
             return
 
         await self.async_refresh()
@@ -333,6 +339,57 @@ class HomeConnectApplianceCoordinator(DataUpdateCoordinator[HomeConnectAppliance
             if EventKey.BSH_COMMON_APPLIANCE_DEPAIRED not in context:
                 listener()
         self.call_all_event_listeners()
+
+    async def _fetch_status_while_refresh_disabled(self) -> None:
+        """Fetch the appliance status while the full refresh is disabled.
+
+        The API doesn't replay the events sent while the appliance or the event
+        stream was disconnected, so without this, the status (e.g. the operation
+        state) could be outdated for as long as the connection keeps flapping.
+        To not hit the API rate limit, only the status is fetched, and only once
+        per THROTTLED_STATUS_FETCH_INTERVAL.
+        """
+        if not self.data.info.connected:
+            # The API can't return the status of a disconnected appliance,
+            # so don't waste the request (and the interval) on it.
+            return
+        now = self.hass.loop.time()
+        if (
+            self._last_status_fetch is not None
+            and now - self._last_status_fetch < THROTTLED_STATUS_FETCH_INTERVAL
+        ):
+            return
+        self._last_status_fetch = now
+        ha_id = self.data.info.ha_id
+        try:
+            status = (await self.client.get_status(ha_id)).status
+        except HomeConnectError as error:
+            _LOGGER.debug("Error fetching status for %s: %s", ha_id, error)
+            return
+
+        stored_status = self.data.status
+        changed_status = [
+            Event(
+                key=EventKey(item.key.value),
+                raw_key=item.raw_key,
+                timestamp=0,
+                level="",
+                handling="",
+                value=item.value,
+            )
+            for item in status
+            if item.key is not StatusKey.UNKNOWN
+            and (
+                (stored_item := stored_status.get(item.key)) is None
+                or stored_item.value != item.value
+            )
+        ]
+        if changed_status:
+            # Handle the changes as a status event, so the stored data
+            # is updated and the listeners are called as with a real event.
+            await self.event_listener(
+                EventMessage(ha_id, EventType.STATUS, ArrayOfEvents(changed_status))
+            )
 
     async def event_listener(self, event_message: EventMessage) -> None:
         """Match event with listener for event type."""
@@ -705,6 +762,7 @@ class HomeConnectApplianceCoordinator(DataUpdateCoordinator[HomeConnectAppliance
                 status.key: status
                 for status in (await self.client.get_status(appliance.ha_id)).status
             }
+            self._last_status_fetch = self.hass.loop.time()
         except TooManyRequestsError:
             raise
         except HomeConnectError as error:

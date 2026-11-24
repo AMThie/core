@@ -53,8 +53,10 @@ from homeassistant.components.home_connect.const import (
     BSH_DOOR_STATE_LOCKED,
     BSH_DOOR_STATE_OPEN,
     BSH_EVENT_PRESENT_STATE_PRESENT,
+    BSH_OPERATION_STATE_DELAYED_START,
     BSH_OPERATION_STATE_FINISHED,
     BSH_OPERATION_STATE_READY,
+    BSH_OPERATION_STATE_RUN,
     BSH_POWER_OFF,
     DOMAIN,
 )
@@ -81,6 +83,7 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 
+from . import create_operation_state_status
 from .conftest import SERVER_ACCESS_TOKEN
 
 INITIAL_FETCH_CLIENT_METHODS = [
@@ -965,6 +968,185 @@ async def test_coordinator_disabling_updates_for_appliance(
     await hass.async_block_till_done()
 
     assert hass.states.is_state("switch.dishwasher_power", STATE_OFF)
+
+
+@pytest.mark.parametrize("appliance", [ApplianceType.DISHWASHER], indirect=True)
+async def test_status_fetched_on_reconnection_while_updates_are_disabled(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    client: MagicMock,
+    config_entry: MockConfigEntry,
+    integration_setup: Callable[[MagicMock], Awaitable[bool]],
+    appliance: HomeAppliance,
+) -> None:
+    """Test the status is fetched on reconnection while updates are disabled.
+
+    The API doesn't replay the events sent while the appliance was disconnected,
+    so the status has to be fetched to not keep showing an outdated operation state.
+    """
+    entity_id = "sensor.dishwasher_operation_state"
+    client.get_status = AsyncMock(
+        return_value=create_operation_state_status(BSH_OPERATION_STATE_DELAYED_START)
+    )
+    assert await integration_setup(client)
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert hass.states.is_state(entity_id, "delayedstart")
+
+    # A flapping connection disables the full refresh of the appliance data
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([]))
+            for _ in range(8)
+        ]
+    )
+    await hass.async_block_till_done()
+    for method in INITIAL_FETCH_CLIENT_METHODS:
+        getattr(client, method).reset_mock()
+
+    # The program starts while the appliance is disconnected,
+    # so the operation state event is never received
+    client.get_status.return_value = create_operation_state_status(
+        BSH_OPERATION_STATE_RUN
+    )
+    freezer.tick(timedelta(minutes=10))
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.DISCONNECTED, ArrayOfEvents([])),
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([])),
+        ]
+    )
+    await hass.async_block_till_done()
+
+    assert hass.states.is_state(entity_id, "run")
+    client.get_status.assert_awaited_once_with(appliance.ha_id)
+    for method in INITIAL_FETCH_CLIENT_METHODS:
+        if method != "get_status":
+            getattr(client, method).assert_not_awaited()
+
+    # The status is not fetched again until the interval has passed
+    client.get_status.reset_mock()
+    client.get_status.return_value = create_operation_state_status(
+        BSH_OPERATION_STATE_FINISHED
+    )
+    freezer.tick(timedelta(minutes=2))
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.DISCONNECTED, ArrayOfEvents([])),
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([])),
+        ]
+    )
+    await hass.async_block_till_done()
+
+    client.get_status.assert_not_awaited()
+    assert hass.states.is_state(entity_id, "run")
+
+    freezer.tick(timedelta(minutes=8))
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.DISCONNECTED, ArrayOfEvents([])),
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([])),
+        ]
+    )
+    await hass.async_block_till_done()
+
+    client.get_status.assert_awaited_once_with(appliance.ha_id)
+    assert hass.states.is_state(entity_id, "finished")
+
+
+@pytest.mark.parametrize("appliance", [ApplianceType.DISHWASHER], indirect=True)
+async def test_status_fetch_error_on_reconnection_while_updates_are_disabled(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    client: MagicMock,
+    config_entry: MockConfigEntry,
+    integration_setup: Callable[[MagicMock], Awaitable[bool]],
+    appliance: HomeAppliance,
+) -> None:
+    """Test an error fetching the status while updates are disabled is handled."""
+    entity_id = "sensor.dishwasher_operation_state"
+    client.get_status = AsyncMock(
+        return_value=create_operation_state_status(BSH_OPERATION_STATE_DELAYED_START)
+    )
+    assert await integration_setup(client)
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([]))
+            for _ in range(8)
+        ]
+    )
+    await hass.async_block_till_done()
+
+    client.get_status.reset_mock()
+    client.get_status.side_effect = TooManyRequestsError("error.key")
+    freezer.tick(timedelta(minutes=10))
+    await client.add_events(
+        [
+            EventMessage(appliance.ha_id, EventType.DISCONNECTED, ArrayOfEvents([])),
+            EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([])),
+        ]
+    )
+    await hass.async_block_till_done()
+
+    client.get_status.assert_awaited_once_with(appliance.ha_id)
+    assert hass.states.is_state(entity_id, "delayedstart")
+
+
+@pytest.mark.parametrize("appliance", [ApplianceType.DISHWASHER], indirect=True)
+async def test_status_not_fetched_for_disconnected_appliance_while_updates_are_disabled(
+    hass: HomeAssistant,
+    freezer: FrozenDateTimeFactory,
+    client: MagicMock,
+    config_entry: MockConfigEntry,
+    integration_setup: Callable[[MagicMock], Awaitable[bool]],
+    appliance: HomeAppliance,
+) -> None:
+    """Test the status isn't fetched for a disconnected appliance on stream reconnection.
+
+    It would fail and the next status fetch, when the appliance
+    connects again, would be skipped because of the interval.
+    """
+    entity_id = "sensor.dishwasher_operation_state"
+    client.get_status = AsyncMock(
+        return_value=create_operation_state_status(BSH_OPERATION_STATE_DELAYED_START)
+    )
+    assert await integration_setup(client)
+    assert config_entry.state is ConfigEntryState.LOADED
+
+    await client.add_events(
+        [
+            *(
+                EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([]))
+                for _ in range(8)
+            ),
+            EventMessage(appliance.ha_id, EventType.DISCONNECTED, ArrayOfEvents([])),
+        ]
+    )
+    await hass.async_block_till_done()
+    client.get_status.reset_mock()
+    client.get_status.return_value = create_operation_state_status(
+        BSH_OPERATION_STATE_RUN
+    )
+    freezer.tick(timedelta(minutes=10))
+
+    # The event stream reconnects while the appliance is disconnected
+    await client.add_events([EventStreamInterruptedError("error")])
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+    await hass.async_block_till_done()
+    await client.add_events([None])
+    await hass.async_block_till_done()
+
+    client.get_status.assert_not_awaited()
+
+    await client.add_events(
+        [EventMessage(appliance.ha_id, EventType.CONNECTED, ArrayOfEvents([]))]
+    )
+    await hass.async_block_till_done()
+
+    client.get_status.assert_awaited_once_with(appliance.ha_id)
+    assert hass.states.is_state(entity_id, "run")
 
 
 async def test_coordinator_disabling_updates_for_appliance_is_gone_after_entry_reload(
